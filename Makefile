@@ -71,6 +71,29 @@ else
 	GIT_TREE_STATE ?= clean
 endif
 
+BUILDER_IMAGE_DOCKERFILE ?= hack/build-image/Dockerfile
+
+# Calculate the realpath of the build-image Dockerfile as we `cd` into the hack/build
+# directory before this Dockerfile is used and any relative path will not be valid.
+BUILDER_IMAGE_DOCKERFILE_REALPATH := $(shell realpath $(BUILDER_IMAGE_DOCKERFILE))
+
+# Build image handling. We push a build image for every changed version of
+# /hack/build-image/Dockerfile. We tag the dockerfile with the short commit hash
+# of the commit that changed it. When determining if there is a build image in
+# the registry to use we look for one that matches the current "commit" for the
+# Dockerfile else we make one.
+# In the case where the Dockerfile for the build image has been overridden using
+# the BUILDER_IMAGE_DOCKERFILE variable, we always force a build.
+
+ifneq "$(origin BUILDER_IMAGE_DOCKERFILE)" "file"
+	BUILDER_IMAGE_TAG := "custom"
+else
+	BUILDER_IMAGE_TAG := $(shell git log -1 --pretty=%h $(BUILDER_IMAGE_DOCKERFILE))
+endif
+
+BUILDER_IMAGE := $(REGISTRY)/build-image:$(BUILDER_IMAGE_TAG)
+BUILDER_IMAGE_CACHED := $(shell docker images -q ${BUILDER_IMAGE} 2>/dev/null )
+
 ###
 ### These variables should not need tweaking.
 ###
@@ -79,6 +102,9 @@ platform_temp = $(subst -, ,$(ARCH))
 GOOS = $(word 1, $(platform_temp))
 GOARCH = $(word 2, $(platform_temp))
 GOPROXY ?= https://proxy.golang.org
+
+build-%:
+	@$(MAKE) --no-print-directory ARCH=$* build
 
 local: build-dirs
 	GOOS=$(GOOS) \
@@ -91,6 +117,47 @@ local: build-dirs
 	GIT_TREE_STATE=$(GIT_TREE_STATE) \
 	OUTPUT_DIR=$$(pwd)/_output/bin/$(GOOS)/$(GOARCH) \
 	./hack/build.sh
+
+build: _output/bin/$(GOOS)/$(GOARCH)/$(BIN)
+
+_output/bin/$(GOOS)/$(GOARCH)/$(BIN): build-dirs
+	@echo "building: $@"
+	$(MAKE) shell CMD="-c '\
+		GOOS=$(GOOS) \
+		GOARCH=$(GOARCH) \
+		VERSION=$(VERSION) \
+		REGISTRY=$(REGISTRY) \
+		PKG=$(PKG) \
+		BIN=$(BIN) \
+		GIT_SHA=$(GIT_SHA) \
+		GIT_TREE_STATE=$(GIT_TREE_STATE) \
+		OUTPUT_DIR=/output/$(GOOS)/$(GOARCH) \
+		./hack/build.sh'"
+
+TTY := $(shell tty -s && echo "-t")
+
+# Example: make shell CMD="date > datefile"
+shell: build-dirs build-env
+	@# bind-mount the Velero root dir in at /github.com/vmware-tanzu/velero
+	@# because the Kubernetes code-generator tools require the project to
+	@# exist in a directory hierarchy ending like this (but *NOT* necessarily
+	@# under $GOPATH).
+	@docker run \
+		-e GOFLAGS \
+		-e GOPROXY \
+		-i $(TTY) \
+		--rm \
+		-u $$(id -u):$$(id -g) \
+		-v "$$(pwd):/github.com/vmware-tanzu/velero:delegated" \
+		-v "$$(pwd)/_output/bin:/output:delegated" \
+		-v "$$(pwd)/.go/pkg:/go/pkg:delegated" \
+		-v "$$(pwd)/.go/std:/go/std:delegated" \
+		-v "$$(pwd)/.go/std/$(GOOS)/$(GOARCH):/usr/local/go/pkg/$(GOOS)_$(GOARCH)_static:delegated" \
+		-v "$$(pwd)/.go/go-build:/.cache/go-build:delegated" \
+		-v "$$(pwd)/.go/golangci-lint:/.cache/golangci-lint:delegated" \
+		-w /github.com/vmware-tanzu/velero \
+		$(BUILDER_IMAGE) \
+		/bin/sh $(CMD)
 
 # test runs unit tests using 'go test' in the local environment.
 test:
@@ -126,6 +193,41 @@ endif
 
 build-dirs:
 	@mkdir -p _output/bin/$(GOOS)/$(GOARCH)
+
+build-env:
+	@# if we have overridden the value for the build-image Dockerfile,
+	@# force a build using that Dockerfile
+	@# if we detect changes in dockerfile force a new build-image
+	@# else if we dont have a cached image make one
+	@# finally use the cached image
+ifneq "$(origin BUILDER_IMAGE_DOCKERFILE)" "file"
+	@echo "Dockerfile for builder image has been overridden to $(BUILDER_IMAGE_DOCKERFILE)"
+	@echo "Preparing a new builder-image"
+	$(MAKE) build-image
+else ifneq ($(shell git diff --quiet HEAD -- $(BUILDER_IMAGE_DOCKERFILE); echo $$?), 0)
+	@echo "Local changes detected in $(BUILDER_IMAGE_DOCKERFILE)"
+	@echo "Preparing a new builder-image"
+	$(MAKE) build-image
+else ifneq ($(BUILDER_IMAGE_CACHED),)
+	@echo "Using Cached Image: $(BUILDER_IMAGE)"
+else
+	@echo "Trying to pull build-image: $(BUILDER_IMAGE)"
+	docker pull -q $(BUILDER_IMAGE) || $(MAKE) build-image
+endif
+
+build-image:
+	@# When we build a new image we just untag the old one.
+	@# This makes sure we don't leave the orphaned image behind.
+	$(eval old_id=$(shell docker image inspect  --format '{{ .ID }}' ${BUILDER_IMAGE} 2>/dev/null))
+ifeq ($(BUILDX_ENABLED), true)
+	@cd hack/build-image && docker buildx build --build-arg=GOPROXY=$(GOPROXY) --output=type=docker --pull -t $(BUILDER_IMAGE) -f $(BUILDER_IMAGE_DOCKERFILE_REALPATH) .
+else
+	@cd hack/build-image && docker build --build-arg=GOPROXY=$(GOPROXY) --pull -t $(BUILDER_IMAGE) -f $(BUILDER_IMAGE_DOCKERFILE_REALPATH) .
+endif
+	$(eval new_id=$(shell docker image inspect  --format '{{ .ID }}' ${BUILDER_IMAGE} 2>/dev/null))
+	@if [ "$(old_id)" != "" ] && [ "$(old_id)" != "$(new_id)" ]; then \
+		docker rmi -f $$id || true; \
+	fi	
 
 .PHONY: modules
 modules:
